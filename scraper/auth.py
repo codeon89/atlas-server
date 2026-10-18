@@ -1,15 +1,20 @@
 """
-F95 authenticated session.
+XenForo authenticated sessions over requests (LewdCorner).
 
-Strategy (per requirements):
+F95zone no longer fetches through requests: Cloudflare rejects scripted HTTP
+clients, so F95 pages come from the browser transport in
+`scraper/browser.py` (a persistent patchright profile carrying the clearance
+and the login), and `F95Session` below is a thin delegator onto it.
+
+Strategy for the requests-based sessions (per requirements):
   - Log in once with the dummy account credentials from .env.
   - Persist the resulting cookies to disk.
   - On every run, reuse the cached cookie and only log in again when it
     has expired. This avoids logging in on every scrape.
 
-F95zone runs XenForo 2. Login is a POST to /login/login with the page's
-CSRF token (_xfToken). A live session is verified by the `data-logged-in`
-attribute on the root <html> element of any page.
+XenForo 2 login is a POST to /login/login with the page's CSRF token
+(_xfToken). A live session is verified by the `data-logged-in` attribute on
+the root <html> element of any page.
 """
 import json
 import os
@@ -21,6 +26,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from scraper.config import config
+# No cycle: scraper.browser defers its scraper.auth import to call time.
+from scraper.browser import challenged_response, save_handoff
 
 # Use the OS trust store (Windows/corporate/AV roots) for TLS verification.
 # Fixes "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate"
@@ -282,42 +289,285 @@ class XenForoSession:
         try:
             return r.json()
         except ValueError:
+            if r.status_code != 200:
+                print(f"  unhandled HTTP {r.status_code} on {url}; body unparsed, skipping")
             return None
 
 
-class F95Session(XenForoSession):
-    """F95zone session (behaviour unchanged from the original)."""
+class F95CookieSession:
+    """requests-based fast tier, fed by the browser handoff.
+
+    The handoff harvested from BrowserSession (UA + cf_clearance cookie)
+    is what a plain requests.Session needs to pass Cloudflare on the
+    listing API and ordinary pages. Headers are set once here: the XHR
+    pair (X-Requested-With + Referer) is required by the SAM listing API
+    and accepted harmlessly by the other pages. Deliberately no login
+    machinery: liveness of the login cookie is checked higher up, in the
+    ladder. Responses are returned raw; requests.Response already
+    exposes everything consumers (f95.py, the feed path) read.
+    """
+
+    def __init__(self, handoff, base="https://f95zone.to",
+                 session_cls=requests.Session):
+        self.base = base.rstrip("/")
+        self._session = session_cls()
+        self._session.headers["User-Agent"] = handoff.get("user_agent", "")
+        self._session.headers["X-Requested-With"] = "XMLHttpRequest"
+        self._session.headers["Referer"] = self.base + "/latest-updates/"
+        for cookie in (handoff.get("cookies") or []):
+            if not isinstance(cookie, dict):
+                continue  # usable handoffs still allow junk entries alongside dicts
+            if "f95zone" not in (cookie.get("domain") or ""):
+                continue
+            if not isinstance(cookie.get("name"), str):
+                continue  # a nameless f95zone entry cannot be set on a jar
+            self._session.cookies.set(
+                cookie["name"], cookie.get("value", ""),
+                domain=cookie.get("domain"), path=cookie.get("path", "/"))
+
+    def get(self, url, timeout=30, allow_redirects=True, **kwargs):
+        return self._session.get(
+            url, timeout=timeout, allow_redirects=allow_redirects, **kwargs)
+
+
+def f95_cookie_session():
+    """The fast tier when a usable handoff is on disk, else None so the
+    caller knows to go the browser route."""
+    # late import both ways: scraper.browser late-imports scraper.auth
+    from scraper.browser import load_handoff
+    handoff = load_handoff()
+    if handoff is None:
+        return None
+    return F95CookieSession(handoff)
+
+
+class F95Session:
+    """f95zone session on the patchright browser transport.
+
+    All requests-based machinery here was dropped: f95zone.to answers
+    every scripted non-browser client (requests, curl_cffi) with the
+    Cloudflare challenge wall, so the transport must be a real Chromium
+    process (scraper.browser.BrowserSession). The outward contract stays
+    the old one -- ensure_authenticated/get/get_json/resolve_masked -- so
+    agents and scripts keep calling exactly what they always did. The
+    browser profile holds the state (Cloudflare clearance, session
+    cookies, login) that the cookie JSON file used to hold; the
+    cookie_file argument is accepted for call-site compatibility only.
+    """
 
     BASE = "https://f95zone.to"
 
-    def __init__(self, cookie_file=None):
-        super().__init__(cookie_file or config.f95_cookie_file())
+    def __init__(self, cookie_file=None, session=None):
+        from scraper.browser import BrowserSession  # late import both ways
+        self.cookie_file = cookie_file  # unused; kept so callers keep working
+        self.session = session or BrowserSession()
+        self._authenticated = False
+        self._auth_checked_at = 0.0   # monotonic stamp of last liveness proof
+        self._login_failed_at = None  # set on failure, cleared on success
+        self._fast = None
+        self._escalations = 0
+        self._pinned = False
+        self._force_browser = os.environ.get("F95_TRANSPORT", "hybrid") != "hybrid"
 
-    def _credentials(self):
-        return config.f95_user(), config.f95_password()
+    _MAX_ESCALATIONS = 2
+
+    def _fetch(self, url):
+        """Response for url via the hybrid ladder: fast tier, one plain
+        retry when challenged, then escalation to the browser tier."""
+        if self._pinned or self._force_browser:
+            # Browser tier only. It raises CfBlocked itself when stuck;
+            # that propagates unchanged.
+            return self.session.request(url)
+        if self._fast is None:
+            self._fast = f95_cookie_session()
+        if self._fast is None:
+            return self.session.request(url)
+        resp = self._fast.get(url)
+        if not challenged_response(resp):
+            return resp
+        # Ladder retry, not scraping pace: hand-tuned sleeps belong to
+        # the agent above, this one just lets a flapping wall flap back.
+        time.sleep(1.0)
+        resp = self._fast.get(url)
+        if not challenged_response(resp):
+            # Plain-retry successes never count against the escalation budget.
+            return resp
+        return self._escalate(url)
+
+    def _escalate(self, url):
+        self._escalations += 1
+        if self._escalations > self._MAX_ESCALATIONS:
+            # Two strikes: the harvested clearance is not holding up; the
+            # rest of this process rides the browser tier. Nothing here
+            # persists the pin -- a fresh process tries fast again.
+            self._pinned = True
+            self._fast = None
+            return self.session.request(url)
+        # The partner is the real BrowserSession: ready it through the
+        # primitives it actually has (verify-liveness-login), not the
+        # session-level wrapper it does not have.
+        self._browser_partner_ready()
+        handoff = self._export_handoff()
+        if handoff is not None:
+            save_handoff(config.f95_handoff_file(), handoff)
+        self._fast = f95_cookie_session()
+        if self._fast is None:
+            return self.session.request(url)
+        retry = self._fast.get(url)
+        if not challenged_response(retry):
+            # A clean rebuilt retry resets the budget: a challenge storm
+            # (still challenged) never resets, self-healing expiries do.
+            self._escalations = 0
+            return retry
+        # Still challenged: serve this one through the browser so the run
+        # keeps its data; the next run starts fast from the handoff above.
+        return self.session.request(url)
+
+    def ensure_authenticated(self):
+        """Profile verify, throttled to once per XF_AUTH_TTL seconds (the
+        same knob the requests-based session used). While the fast tier
+        holds, the proof is one cheap fast-tier probe of /whats-new/
+        instead of a browser page render; the browser only launches when
+        that probe shows the harvested login died."""
+        if not self._pinned and not self._force_browser:
+            if self._fast is None:
+                self._fast = f95_cookie_session()
+            if self._fast is not None:
+                if self._authenticated and self._ttl_current():
+                    return
+                resp = self._fetch(self.BASE + "/whats-new/")
+                if resp.status_code == 200 and \
+                        XenForoSession._is_logged_in_html(resp.text):
+                    self._authenticated = True
+                    self._auth_checked_at = time.monotonic()
+                    return
+                # The page fetched but the login flag is off: the harvested
+                # login is dead. The browser profile carries the same
+                # session, so its is_logged_in() would only spend a page
+                # load repeating what the probe just proved. Re-login
+                # directly, under the same cooldown the shipped browser
+                # path uses, then re-harvest the handoff so the fast tier
+                # resumes.
+                self._fast = None
+                self._authenticated = False
+                self._browser_partner_login()
+                handoff = self._export_handoff()
+                if handoff is not None:
+                    save_handoff(config.f95_handoff_file(), handoff)
+                self._fast = f95_cookie_session()
+                return
+            # Cold start with no handoff: harvest from the just-verified browser
+            # instead of riding it for the whole process. A partner that
+            # cannot export (bare delegate) just rides the browser tier.
+            self._browser_partner_ready()
+            handoff = self._export_handoff()
+            if handoff is None:
+                return
+            save_handoff(config.f95_handoff_file(), handoff)
+            self._fast = f95_cookie_session()
+            return
+        self._browser_partner_ready()
+
+    def _export_handoff(self):
+        """The browser partner's handoff (session cookie export), or None
+        when the delegate has no export_handoff -- the save/serve calls
+        above then skip persistence and stay on the browser tier."""
+        export = getattr(self.session, "export_handoff", None)
+        return export() if export is not None else None
+
+    def _ttl_current(self):
+        """True while the liveness stamp is still trusted: either the
+        periodic check is disabled or the last proof is younger than
+        XF_AUTH_TTL. One copy for both ensure_authenticated and the
+        browser partner verification."""
+        ttl = _auth_ttl()
+        if ttl <= 0:
+            return True
+        return (time.monotonic() - self._auth_checked_at) < ttl
+
+    def _browser_partner_ready(self):
+        """The browser partner challenged-and-logged-in: throttled profile
+        verify (the same XF_AUTH_TTL knob), a cheap liveness proof, then
+        a cooldown-gated login if the profile is spent. Touches only the
+        BrowserSession primitives that exist for real (is_logged_in,
+        login), so escalation and the auth check share it verbatim."""
+        if self._authenticated:
+            if self._ttl_current():
+                return
+            # Stale stamp: prove it cheaply rather than re-login.
+            if self.session.is_logged_in():
+                self._auth_checked_at = time.monotonic()
+                return
+            self._authenticated = False
+        if self.session.is_logged_in():
+            self._authenticated = True
+            self._auth_checked_at = time.monotonic()
+            return
+        self._browser_partner_login()
+
+    def _browser_partner_login(self):
+        """One login POST under the XF_REAUTH_COOLDOWN gap the requests
+        session used: a wrong password must not become one attempt per
+        queued row, since each attempt drives a real form submit."""
+        if self._login_failed_at is not None and \
+                (time.monotonic() - self._login_failed_at) < _reauth_cooldown():
+            raise AuthError(
+                "browser login still in cooldown after an earlier failure; "
+                "check F95_USER/F95_PASSWORD")
+        try:
+            self.session.login(config.f95_user(), config.f95_password())
+        except AuthError:
+            self._login_failed_at = time.monotonic()
+            raise
+        self._login_failed_at = None
+        self._authenticated = True
+        self._auth_checked_at = time.monotonic()
+
+    def get(self, url, **kwargs):
+        # kwargs (timeout, allow_redirects, headers...) are deliberately
+        # dropped for the browser tier: BrowserSession.request takes a
+        # milliseconds-based timeout, so forwarding seconds-based kwargs
+        # would be unsafe. Known caller that passes some anyway:
+        # tools/diagnostics/test_masked_resolve.py:181 sends timeout=30
+        # and gets the transport's own value instead.
+        self.ensure_authenticated()
+        return self._fetch(url)
+
+    def get_json(self, url, **kwargs):
+        """Authenticated GET that returns parsed JSON (or None). Used for
+        the listing feed; a body that is not JSON still reads as None to
+        the caller. The ladder absorbs challenges before this point, so
+        what reaches here is a real page or a CfBlocked from the browser
+        tier when the wall cannot be cleared."""
+        resp = self.get(url, **kwargs)
+        try:
+            return json.loads(resp.text)
+        except ValueError:
+            if resp.status_code != 200:
+                print(f"  unhandled HTTP {resp.status_code} on {url}; body unparsed, skipping")
+            return None
 
     def resolve_masked(self, url):
         """Resolve an F95 /masked/ link to its real destination URL.
 
         Masked tokens are encrypted server-side and cannot be decoded
-        offline, so this makes ONE network request (authenticated) and reads
-        the redirect target. Resolve lazily/on demand — not for every mirror
-        on every scrape — to avoid rate limiting.
+        offline, so this makes ONE network request (authenticated) and
+        reads the redirect target or the external-link anchor. Resolve
+        lazily/on demand -- not for every mirror on every scrape -- to
+        avoid rate limiting.
+
+        Never exercised against the live site: nothing on the refresh
+        path resolves masked links today, so this has no production
+        caller yet.
 
         Returns the destination URL, or None if it couldn't be resolved.
-        (Untested against the live site from the build sandbox; verify on a
-        machine that can reach f95zone.to.)
         """
         if "/masked/" not in (url or ""):
             return url
         self.ensure_authenticated()
         try:
-            r = self.session.get(url, timeout=30, allow_redirects=False)
-            loc = r.headers.get("Location")
-            if loc and "/masked/" not in loc:
-                return loc
-            r = self.session.get(url, timeout=30, allow_redirects=True)
-        except requests.RequestException:
+            r = self._fetch(url)
+        except Exception:
             return None
         if r.url and "f95zone.to" not in urlparse(r.url).netloc:
             return r.url

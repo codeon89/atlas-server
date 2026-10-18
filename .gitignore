@@ -4,8 +4,8 @@
 .env
 .env.*
 !.env.example
-f95_cookies.json
-lc_cookies.json
+f95_cookies.json*
+lc_cookies.json*
 dbCredentials.py
 config.php
 
@@ -50,3 +50,7 @@ public_html/packages/
 .vscode/
 .idea/
 *.zip
+
+# browser transport profile state (clearance + login cookies)
+f95-profile/
+f95-handoff.json*

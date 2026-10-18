@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 
 from scraper.auth import F95Session
 from scraper.agents import RefreshOutcome
+from scraper.browser import CfBlocked
 from scraper.agents.f95_detail import parse_thread_detail
 from scraper.datatypes.data import data
 from scraper.datatypes.record import gameRecord
@@ -430,7 +431,6 @@ class f95:
         (like a new game) so a transient blip doesn't wipe a good row down to
         listing-only fields.
         """
-        self.session.ensure_authenticated()
         f95_id = str(f95_id)
 
         atlas = gameRecord.atlasRecord()
@@ -439,9 +439,20 @@ class f95:
         f95rec["site_url"] = threadURL(f95_id)
 
         print("refresh:", f95_id, threadURL(f95_id))
-        ok = self._fetch_detail(
-            f95rec["site_url"], atlas, f95rec, retries=_detail_retries(),
-        )
+        try:
+            # Inside the try on purpose: the challenge usually bites on the
+            # very first liveness probe (homepage), not the detail page.
+            self.session.ensure_authenticated()
+            ok = self._fetch_detail(
+                f95rec["site_url"], atlas, f95rec, retries=_detail_retries(),
+            )
+        except CfBlocked as ex:
+            msg = (f"f95 {f95_id}: Cloudflare challenge unsolved after "
+                   f"{os.environ.get('F95_CF_CLICK_ATTEMPTS', '10')} click "
+                   f"attempt(s) ({ex}). Browser profile kept for the next "
+                   f"run; re-enqueue via the admin portal if it persists.")
+            print("  cf_blocked:", msg)
+            return RefreshOutcome(False, "cf_blocked", msg)
         if not ok:
             msg = (f"f95 {f95_id}: detail fetch failed after "
                    f"{_detail_retries() + 1} attempt(s) for "
@@ -475,6 +486,11 @@ class f95:
             _jitter()  # politeness + jitter -- ONLY right before a page load.
             try:
                 r = self.session.get(site_url)
+            except CfBlocked:
+                # Challenge the clicks could not clear: distinguishing this
+                # from an ordinary fetch error lets refresh_one mark the
+                # queue row cf_blocked instead of a generic failure.
+                raise
             except Exception as ex:
                 print(f"detail fetch error (attempt {attempt + 1}/"
                       f"{retries + 1}):", ex, site_url)
@@ -490,8 +506,10 @@ class f95:
         d = parse_thread_detail(r.text)
 
         if d.get("logged_in") is False:
-            # Session died and re-login failed; skip rather than store guest data.
-            print("WARNING: not logged in for", site_url, "- skipping gated fields")
+            # Session died and re-login failed; storing guest data would
+            # stamp the row refreshed while the gated fields parse as None.
+            print("WARNING: not logged in for", site_url, "- skipping write")
+            return False
 
         # Identity fields (title / version / short_name / id_name). In the
         # normal listing path these are already set from the feed item before

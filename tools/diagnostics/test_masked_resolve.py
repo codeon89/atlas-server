@@ -48,7 +48,6 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from scraper import auth  # noqa: E402
-from scraper.config import config  # noqa: E402
 from scraper.agents.f95_detail import parse_thread_detail  # noqa: E402
 
 THREAD_URL = "https://f95zone.to/threads/{f95_id}/"
@@ -170,26 +169,17 @@ def analyse_body(body):
 
 
 def probe_masked(session, url, save_body=None, show_body=True):
-    """Request a masked link and classify what came back."""
+    """Request a masked link and classify what came back.
+
+    The browser transport follows redirects itself (allow_redirects has no
+    meaning there), so the un-followed Location probe stage is gone and the
+    final URL alone classifies the answer.
+    """
     print(f"\n  Requesting: {_short(url)}")
 
-    response = session.session.get(url, timeout=30, allow_redirects=False)
-    location = response.headers.get("Location")
+    response = session.get(url, timeout=30)
     print(f"  Status: {response.status_code}")
-    if location:
-        print(f"  Location: {_short(location)}")
 
-    if response.status_code in (301, 302, 303, 307, 308) and location:
-        if "/masked/" not in location:
-            return {
-                "outcome": "A",
-                "destination": location,
-                "host": urlparse(location).netloc,
-                "has_fragment": "#" in location,
-            }
-        print("  Redirect stayed inside /masked/ - following it.")
-
-    response = session.session.get(url, timeout=30, allow_redirects=True)
     final_host = urlparse(response.url).netloc
     print(f"  Final URL: {_short(response.url)}")
 
@@ -268,7 +258,7 @@ def main():
                         help="emit parsed links as JSON and exit")
     args = parser.parse_args()
 
-    print(f"Logging in as {config.f95_user()} ...")
+    print("Logging in ...")
     session = auth.F95Session()
     session.ensure_authenticated()
     print("Authenticated.\n")

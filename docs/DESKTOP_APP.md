@@ -42,9 +42,9 @@ anything. One-folder starts instantly. If you want the single file anyway, set
 Next to itself — not inside the bundle, and not in whatever folder you happened
 to launch from. This is what `scraper.config.app_root()` does: under PyInstaller
 it returns the exe's directory, otherwise the project root. Relative paths in
-`.env` (like `F95_COOKIE_FILE=f95_cookies.json`) resolve against the same place,
-so the session cookie is reused between runs instead of being recreated
-wherever your shell's working directory happened to be.
+`.env` (like `F95_PROFILE_DIR=f95-profile`) resolve against the same place, so
+the browser profile is reused between runs instead of being recreated wherever
+your shell's working directory happened to be.
 
 Point it somewhere else with the `.env file` box on the Settings tab, or the
 `ATLAS_ENV_FILE` environment variable.

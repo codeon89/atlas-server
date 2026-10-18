@@ -65,8 +65,13 @@ cp .env.example .env                       # then fill in real values
 | `DB_USER`, `DB_PASSWORD` | database login |
 | `DB_HOST` | MySQL host. **Set this explicitly** -- the old `DB_HOST_REMOTE`/`DB_HOST_LOCAL` split is gone (there's only one database now, so there's no "remote vs local" choice to make) |
 | `DB_NAME` | database name |
-| `F95_USER`, `F95_PASSWORD` | the **dummy** F95 account used to get a session cookie |
-| `F95_COOKIE_FILE` | where the reusable cookie is cached (also git-ignored) |
+| `F95_USER`, `F95_PASSWORD` | the **dummy** F95 account used for the browser login |
+| `F95_PROFILE_DIR` | Chromium profile holding the Cloudflare clearance and the login (git-ignored, defaults to `f95-profile/`) |
+| `F95_HANDOFF_FILE` | JSON store of the browser session's cookies and User-Agent handed to the fast plain-requests tier (app-root resolved, defaults to `f95-handoff.json`) |
+| `F95_TRANSPORT` | F95 fetch ladder: `hybrid` (default) tries plain requests first and escalates to the browser only on a real Cloudflare challenge; `browser` always uses the browser |
+| `F95_CF_CLICK_ATTEMPTS` | how many clicks on the Cloudflare Turnstile widget before giving up (default 10) |
+| `F95_CF_CLICK_EVERY` | seconds between Cloudflare click attempts (default 10) |
+| `F95_BROWSER_HEADLESS` | run the browser without a visible window (headful is the default) |
 | `PACKAGE_DIR` | where packages are written |
 
 > The DB password that used to be hard-coded in `config.py` should be
@@ -187,17 +192,30 @@ below) — no database reader on the client.
 ## How login / cookie reuse works
 
 F95 hides the data we need (download links, external store/ID links, and the
-Genre/Changelog/Installation/Developer-Notes spoiler sections) from guests.
-So thread **detail** pages are fetched through an authenticated session
-(`scraper/auth.py`):
+Genre/Changelog/Installation/Developer-Notes spoiler sections) from guests,
+and Cloudflare rejects plain HTTP clients outright. Thread **detail** pages
+are therefore fetched through a real browser: `scraper/browser.py` drives a
+persistent Chromium profile (patchright) that carries the Cloudflare
+clearance and the login across runs. By default (`F95_TRANSPORT=hybrid`)
+plain requests fetch what they can, and only a real Cloudflare challenge
+escalates to the browser, which keeps `F95_HANDOFF_FILE` refreshed with its
+cookies and User-Agent for the fast tier.
 
-1. On first run it logs in with the dummy account and saves the cookie to
-   `F95_COOKIE_FILE`.
-2. Every later run reuses that cookie and only logs in again once it has
-   expired — verified by the `data-logged-in` flag on each page.
-3. If the session dies mid-run, it re-logs-in once and retries the request.
+1. The first run logs in with the dummy account. The profile directory
+   (`F95_PROFILE_DIR`, by default `f95-profile/`) keeps the session cookies
+   and the clearance, so later runs reuse both without logging in again.
+2. Login state is re-verified at most once per `XF_AUTH_TTL` seconds
+   (1800 by default), and a login that failed is not retried for
+   `XF_REAUTH_COOLDOWN` seconds, so wrong credentials cannot become one
+   login POST per queued row.
+3. A challenge the clicker cannot clear fails the fetch with `[cf_blocked]`
+   in the queue's `last_error`. The profile keeps whatever the click
+   attempts earned, so re-enqueue the row to continue.
 
-The forum **listing** is public and is fetched without auth.
+The forum **listing** feed is fetched through that same browser session.
+
+LewdCorner keeps the requests-based XenForo session in `scraper/auth.py`
+(`LCSession`), which persists its cookie to `LC_COOKIE_FILE`.
 
 ## What the parser extracts
 

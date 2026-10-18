@@ -131,12 +131,19 @@ class config:
         return app_root()
 
     @staticmethod
-    def f95_cookie_file():
-        # Where the persisted session cookie is stored (kept out of the repo).
-        # A relative F95_COOKIE_FILE resolves against the app root, not the
-        # current working directory -- otherwise the cookie lands wherever the
-        # process happened to be started from and gets re-created every run.
-        return _resolve(os.environ.get("F95_COOKIE_FILE") or "f95_cookies.json")
+    def f95_profile_dir():
+        # Patchright persistent browser profile for the f95 Cloudflare
+        # transport. App-root resolution, so the profile lives in a fixed
+        # place regardless of the working directory the process was
+        # started from.
+        return _resolve(os.environ.get("F95_PROFILE_DIR") or "f95-profile")
+
+    @staticmethod
+    def f95_handoff_file():
+        # Browser-to-requests cookie handoff. Same app-root resolution as
+        # f95_profile_dir so both sides of the handoff live beside the
+        # profile regardless of the working directory.
+        return _resolve(os.environ.get("F95_HANDOFF_FILE") or "f95-handoff.json")
 
     # ----- LewdCorner login (dummy account) -----
     # LewdCorner is XenForo, same as F95, so the auth model is identical:
